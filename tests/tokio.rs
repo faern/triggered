@@ -59,3 +59,40 @@ async fn many_listeners_listen_first() {
         assert!(trigger_instant < wakeup_instant);
     }
 }
+
+#[tokio::test]
+async fn many_sync_and_async_listeners_listen_first() {
+    let (trigger, listener) = triggered::trigger();
+
+    // Spawn a bunch of tasks that all await their own clone of the trigger's listener
+    let mut sync_listeners = Vec::new();
+    let mut async_listeners = Vec::new();
+    for _ in 0..103 {
+        let listener1 = listener.clone();
+        sync_listeners.push(thread::spawn(move || {
+            listener1.wait();
+            Instant::now()
+        }));
+
+        let listener2 = listener.clone();
+        async_listeners.push(tokio::spawn(async {
+            listener2.await;
+            Instant::now()
+        }));
+    }
+
+    // Pause a while to let most/all listener tasks start waiting. Then trigger.
+    thread::sleep(Duration::from_secs(1));
+    let trigger_instant = Instant::now();
+    trigger.trigger();
+
+    // Make sure all tasks finish
+    for listener in sync_listeners {
+        let wakeup_instant = listener.join().expect("Listener task panicked");
+        assert!(trigger_instant < wakeup_instant);
+    }
+    for listener in async_listeners {
+        let wakeup_instant = listener.await.expect("Listener task panicked");
+        assert!(trigger_instant < wakeup_instant);
+    }
+}
