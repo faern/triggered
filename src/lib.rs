@@ -5,7 +5,7 @@ use std::mem;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
 };
 use std::task::{Context, Poll, Waker};
 
@@ -13,6 +13,7 @@ pub fn trigger() -> (Trigger, Listener) {
     let inner = Arc::new(Inner {
         complete: AtomicBool::new(false),
         tasks: Mutex::new(Vec::new()),
+        condvar: Condvar::new(),
     });
     let trigger = Trigger {
         inner: inner.clone(),
@@ -34,6 +35,7 @@ pub struct Listener {
 struct Inner {
     complete: AtomicBool,
     tasks: Mutex<Vec<Waker>>,
+    condvar: Condvar,
 }
 
 impl Unpin for Trigger {}
@@ -54,8 +56,9 @@ impl Trigger {
         let tasks = mem::replace(&mut *tasks_guard, Vec::new());
         mem::drop(tasks_guard);
         for task in tasks {
-            task.wake()
+            task.wake();
         }
+        self.inner.condvar.notify_all();
     }
 }
 
@@ -80,6 +83,30 @@ impl std::future::Future for Listener {
         } else {
             tasks.push(cx.waker().clone());
             Poll::Pending
+        }
+    }
+}
+
+impl Listener {
+    /// Wait for this trigger synchronously. Blocks the current thread until the corresponding
+    /// [`Trigger`] is triggered.
+    pub fn wait(&self) {
+        if self.inner.complete.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let mut guard = self
+            .inner
+            .tasks
+            .lock()
+            .expect("Some Trigger/Listener has panicked");
+
+        while !self.inner.complete.load(Ordering::SeqCst) {
+            guard = self
+                .inner
+                .condvar
+                .wait(guard)
+                .expect("Some Trigger/Listener has panicked");
         }
     }
 }
