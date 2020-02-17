@@ -1,3 +1,6 @@
+#![deny(unsafe_code)]
+#![deny(rust_2018_idioms)]
+
 use std::mem;
 use std::pin::Pin;
 use std::sync::{
@@ -59,7 +62,7 @@ impl Trigger {
 impl std::future::Future for Listener {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.inner.complete.load(Ordering::SeqCst) {
             return Poll::Ready(());
         }
