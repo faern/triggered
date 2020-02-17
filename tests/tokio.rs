@@ -1,5 +1,5 @@
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[tokio::test]
 async fn single_trigger_first() {
@@ -44,15 +44,18 @@ async fn many_listeners_listen_first() {
         let listener = listener.clone();
         listeners.push(tokio::spawn(async {
             listener.await;
+            Instant::now()
         }));
     }
 
     // Pause a while to let most/all listener tasks run their first poll. Then trigger.
     thread::sleep(Duration::from_secs(1));
+    let trigger_instant = Instant::now();
     trigger.trigger();
 
     // Make sure all tasks finish
     for listener in listeners {
-        listener.await.expect("Listener task panicked");
+        let wakeup_instant = listener.await.expect("Listener task panicked");
+        assert!(trigger_instant < wakeup_instant);
     }
 }
