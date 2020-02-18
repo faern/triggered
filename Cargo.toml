@@ -2,9 +2,13 @@
 name = "triggered"
 version = "0.1.0"
 authors = ["Linus Färnstrand <faern@faern.net>"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+description = "Triggers that allows triggering a one time event in another task/thread"
+repository = "https://github.com/faern/triggered"
+keywords = ["async", "future"]
+categories = ["asynchronous", "concurrency"]
 edition = "2018"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 
