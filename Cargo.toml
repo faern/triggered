@@ -4,9 +4,9 @@ version = "0.1.0"
 authors = ["Linus Färnstrand <faern@faern.net>"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-description = "Triggers that allows triggering a one time event in another task/thread"
+description = "Triggers for one time events between tasks and threads"
 repository = "https://github.com/faern/triggered"
-keywords = ["async", "future"]
+keywords = ["async", "future", "sync", "event", "oneshot"]
 categories = ["asynchronous", "concurrency"]
 edition = "2018"
 
@@ -15,3 +15,5 @@ edition = "2018"
 [dev-dependencies]
 tokio = { version = "0.2.11", features = ["macros", "rt-threaded"] }
 async-std = { version = "1.5.0", features = ["attributes"] }
+ctrlc = "3.1.4"
+futures = "0.3.4"
