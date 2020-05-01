@@ -59,3 +59,18 @@ fn many_listeners_listen_first() {
         assert!(trigger_instant < wakeup_instant);
     }
 }
+
+#[test]
+fn is_triggered() {
+    let (trigger, listener) = triggered::trigger();
+    assert!(!trigger.is_triggered());
+    assert!(!listener.is_triggered());
+    trigger.trigger();
+    assert!(trigger.is_triggered());
+    assert!(listener.is_triggered());
+
+    // Check so a second trigger does not do anything unexpected.
+    trigger.trigger();
+    assert!(trigger.is_triggered());
+    assert!(listener.is_triggered());
+}

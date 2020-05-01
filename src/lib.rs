@@ -207,6 +207,11 @@ impl Trigger {
         }
         self.inner.condvar.notify_all();
     }
+
+    /// Returns true if this trigger has been triggered.
+    pub fn is_triggered(&self) -> bool {
+        self.inner.complete.load(Ordering::SeqCst)
+    }
 }
 
 impl std::future::Future for Listener {
@@ -257,5 +262,10 @@ impl Listener {
                 .wait(guard)
                 .expect("Some Trigger/Listener has panicked");
         }
+    }
+
+    /// Returns true if this trigger has been triggered.
+    pub fn is_triggered(&self) -> bool {
+        self.inner.complete.load(Ordering::SeqCst)
     }
 }

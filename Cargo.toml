@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 description = "Triggers for one time events between tasks and threads"
 repository = "https://github.com/faern/triggered"
-keywords = ["async", "future", "sync", "event", "oneshot"]
+keywords = ["oneshot", "mpmc", "async", "sync", "event"]
 categories = ["asynchronous", "concurrency"]
 edition = "2018"
 

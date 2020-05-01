@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 
 ## [Unreleased]
+### Added
+- Add `is_triggered` method to both `Trigger` and `Listener`.
 
 
 ## [0.1.0] - 2020-04-20
