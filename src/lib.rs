@@ -200,7 +200,7 @@ impl Trigger {
             .tasks
             .lock()
             .expect("Some Trigger/Listener has panicked");
-        let tasks = mem::replace(&mut *tasks_guard, Vec::new());
+        let tasks = mem::take(&mut *tasks_guard);
         mem::drop(tasks_guard);
         for task in tasks {
             task.wake();
