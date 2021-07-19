@@ -121,10 +121,11 @@
 #![deny(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+use std::collections::HashMap;
 use std::mem;
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Condvar, Mutex,
 };
 use std::task::{Context, Poll, Waker};
@@ -136,13 +137,14 @@ use std::task::{Context, Poll, Waker};
 pub fn trigger() -> (Trigger, Listener) {
     let inner = Arc::new(Inner {
         complete: AtomicBool::new(false),
-        tasks: Mutex::new(Vec::new()),
+        tasks: Mutex::new(HashMap::new()),
         condvar: Condvar::new(),
+        next_listener_id: AtomicUsize::new(1),
     });
     let trigger = Trigger {
         inner: inner.clone(),
     };
-    let listener = Listener { inner };
+    let listener = Listener { inner, id: 0 };
     (trigger, listener)
 }
 
@@ -161,16 +163,37 @@ pub struct Trigger {
 ///
 /// The listener can be cloned and any amount of threads and tasks can wait for the same trigger
 /// at the same time.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Listener {
     inner: Arc<Inner>,
+    id: usize,
+}
+
+impl Clone for Listener {
+    fn clone(&self) -> Self {
+        Listener {
+            inner: self.inner.clone(),
+            id: self.inner.next_listener_id.fetch_add(1, Ordering::SeqCst),
+        }
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.inner
+            .tasks
+            .lock()
+            .expect("Some Trigger/Listener has panicked")
+            .remove(&self.id);
+    }
 }
 
 #[derive(Debug)]
 struct Inner {
     complete: AtomicBool,
-    tasks: Mutex<Vec<Waker>>,
+    tasks: Mutex<HashMap<usize, Waker>>,
     condvar: Condvar,
+    next_listener_id: AtomicUsize,
 }
 
 impl Unpin for Trigger {}
@@ -200,9 +223,9 @@ impl Trigger {
             .tasks
             .lock()
             .expect("Some Trigger/Listener has panicked");
-        let tasks = mem::replace(&mut *tasks_guard, Vec::new());
+        let tasks = mem::take(&mut *tasks_guard);
         mem::drop(tasks_guard);
-        for task in tasks {
+        for (_listener_id, task) in tasks {
             task.wake();
         }
         self.inner.condvar.notify_all();
@@ -222,7 +245,7 @@ impl std::future::Future for Listener {
             return Poll::Ready(());
         }
 
-        let mut tasks = self
+        let mut task_guard = self
             .inner
             .tasks
             .lock()
@@ -233,7 +256,7 @@ impl std::future::Future for Listener {
         if self.inner.complete.load(Ordering::SeqCst) {
             Poll::Ready(())
         } else {
-            tasks.push(cx.waker().clone());
+            task_guard.insert(self.id, cx.waker().clone());
             Poll::Pending
         }
     }
@@ -249,17 +272,17 @@ impl Listener {
             return;
         }
 
-        let mut guard = self
+        let mut task_guard = self
             .inner
             .tasks
             .lock()
             .expect("Some Trigger/Listener has panicked");
 
         while !self.inner.complete.load(Ordering::SeqCst) {
-            guard = self
+            task_guard = self
                 .inner
                 .condvar
-                .wait(guard)
+                .wait(task_guard)
                 .expect("Some Trigger/Listener has panicked");
         }
     }
@@ -267,5 +290,85 @@ impl Listener {
     /// Returns true if this trigger has been triggered.
     pub fn is_triggered(&self) -> bool {
         self.inner.complete.load(Ordering::SeqCst)
+    }
+}
+
+#[allow(unsafe_code)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::sync::atomic::AtomicU8;
+    use std::task::{RawWaker, RawWakerVTable};
+
+    #[test]
+    fn polling_listener_keeps_only_last_waker() {
+        let (_trigger, mut listener) = trigger();
+
+        let (waker1, waker_handle1) = create_waker();
+        {
+            let mut context = Context::from_waker(&waker1);
+            let listener = Pin::new(&mut listener);
+            assert_eq!(listener.poll(&mut context), Poll::Pending);
+        }
+        assert!(waker_handle1.data.load(Ordering::SeqCst) & CLONED != 0);
+        assert!(waker_handle1.data.load(Ordering::SeqCst) & DROPPED == 0);
+
+        let (waker2, waker_handle2) = create_waker();
+        {
+            let mut context = Context::from_waker(&waker2);
+            let listener = Pin::new(&mut listener);
+            assert_eq!(listener.poll(&mut context), Poll::Pending);
+        }
+        assert!(waker_handle2.data.load(Ordering::SeqCst) & CLONED != 0);
+        assert!(waker_handle2.data.load(Ordering::SeqCst) & DROPPED == 0);
+        assert!(waker_handle1.data.load(Ordering::SeqCst) & DROPPED != 0);
+    }
+
+    const CLONED: u8 = 0b0001;
+    const WOKE: u8 = 0b0010;
+    const DROPPED: u8 = 0b0100;
+
+    fn create_waker() -> (Waker, Arc<WakerHandle>) {
+        let waker_handle = Arc::new(WakerHandle {
+            data: AtomicU8::new(0),
+        });
+        let data = Arc::into_raw(waker_handle.clone()) as *const _;
+        let raw_waker = RawWaker::new(data, &VTABLE);
+        (unsafe { Waker::from_raw(raw_waker) }, waker_handle)
+    }
+
+    struct WakerHandle {
+        data: AtomicU8,
+    }
+
+    impl Drop for WakerHandle {
+        fn drop(&mut self) {
+            println!("WakerHandle dropped");
+        }
+    }
+
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+
+    unsafe fn clone(data: *const ()) -> RawWaker {
+        let waker_handle = &*(data as *const WakerHandle);
+        waker_handle.data.fetch_or(CLONED, Ordering::SeqCst);
+        Arc::increment_strong_count(waker_handle);
+        RawWaker::new(data, &VTABLE)
+    }
+
+    unsafe fn wake(data: *const ()) {
+        let waker_handle = &*(data as *const WakerHandle);
+        waker_handle.data.fetch_or(WOKE, Ordering::SeqCst);
+    }
+
+    unsafe fn wake_by_ref(_data: *const ()) {
+        todo!();
+    }
+
+    unsafe fn drop(data: *const ()) {
+        let waker_handle = &*(data as *const WakerHandle);
+        waker_handle.data.fetch_or(DROPPED, Ordering::SeqCst);
+        Arc::decrement_strong_count(waker_handle);
     }
 }
