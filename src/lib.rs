@@ -121,10 +121,11 @@
 #![deny(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+use std::collections::HashMap;
 use std::mem;
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Condvar, Mutex,
 };
 use std::task::{Context, Poll, Waker};
@@ -136,13 +137,14 @@ use std::task::{Context, Poll, Waker};
 pub fn trigger() -> (Trigger, Listener) {
     let inner = Arc::new(Inner {
         complete: AtomicBool::new(false),
-        tasks: Mutex::new(Vec::new()),
+        tasks: Mutex::new(HashMap::new()),
         condvar: Condvar::new(),
+        next_listener_id: AtomicUsize::new(1),
     });
     let trigger = Trigger {
         inner: inner.clone(),
     };
-    let listener = Listener { inner };
+    let listener = Listener { inner, id: 0 };
     (trigger, listener)
 }
 
@@ -161,16 +163,37 @@ pub struct Trigger {
 ///
 /// The listener can be cloned and any amount of threads and tasks can wait for the same trigger
 /// at the same time.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Listener {
     inner: Arc<Inner>,
+    id: usize,
+}
+
+impl Clone for Listener {
+    fn clone(&self) -> Self {
+        Listener {
+            inner: self.inner.clone(),
+            id: self.inner.next_listener_id.fetch_add(1, Ordering::SeqCst),
+        }
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.inner
+            .tasks
+            .lock()
+            .expect("Some Trigger/Listener has panicked")
+            .remove(&self.id);
+    }
 }
 
 #[derive(Debug)]
 struct Inner {
     complete: AtomicBool,
-    tasks: Mutex<Vec<Waker>>,
+    tasks: Mutex<HashMap<usize, Waker>>,
     condvar: Condvar,
+    next_listener_id: AtomicUsize,
 }
 
 impl Unpin for Trigger {}
@@ -202,7 +225,7 @@ impl Trigger {
             .expect("Some Trigger/Listener has panicked");
         let tasks = mem::take(&mut *tasks_guard);
         mem::drop(tasks_guard);
-        for task in tasks {
+        for (_listener_id, task) in tasks {
             task.wake();
         }
         self.inner.condvar.notify_all();
@@ -222,7 +245,7 @@ impl std::future::Future for Listener {
             return Poll::Ready(());
         }
 
-        let mut tasks = self
+        let mut task_guard = self
             .inner
             .tasks
             .lock()
@@ -233,7 +256,7 @@ impl std::future::Future for Listener {
         if self.inner.complete.load(Ordering::SeqCst) {
             Poll::Ready(())
         } else {
-            tasks.push(cx.waker().clone());
+            task_guard.insert(self.id, cx.waker().clone());
             Poll::Pending
         }
     }
@@ -249,17 +272,17 @@ impl Listener {
             return;
         }
 
-        let mut guard = self
+        let mut task_guard = self
             .inner
             .tasks
             .lock()
             .expect("Some Trigger/Listener has panicked");
 
         while !self.inner.complete.load(Ordering::SeqCst) {
-            guard = self
+            task_guard = self
                 .inner
                 .condvar
-                .wait(guard)
+                .wait(task_guard)
                 .expect("Some Trigger/Listener has panicked");
         }
     }
