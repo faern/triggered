@@ -269,3 +269,83 @@ impl Listener {
         self.inner.complete.load(Ordering::SeqCst)
     }
 }
+
+#[allow(unsafe_code)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::sync::atomic::AtomicU8;
+    use std::task::{RawWaker, RawWakerVTable};
+
+    #[test]
+    fn polling_listener_keeps_only_last_waker() {
+        let (_trigger, mut listener) = trigger();
+
+        let (waker1, waker_handle1) = create_waker();
+        {
+            let mut context = Context::from_waker(&waker1);
+            let listener = Pin::new(&mut listener);
+            assert_eq!(listener.poll(&mut context), Poll::Pending);
+        }
+        assert!(waker_handle1.data.load(Ordering::SeqCst) & CLONED != 0);
+        assert!(waker_handle1.data.load(Ordering::SeqCst) & DROPPED == 0);
+
+        let (waker2, waker_handle2) = create_waker();
+        {
+            let mut context = Context::from_waker(&waker2);
+            let listener = Pin::new(&mut listener);
+            assert_eq!(listener.poll(&mut context), Poll::Pending);
+        }
+        assert!(waker_handle2.data.load(Ordering::SeqCst) & CLONED != 0);
+        assert!(waker_handle2.data.load(Ordering::SeqCst) & DROPPED == 0);
+        assert!(waker_handle1.data.load(Ordering::SeqCst) & DROPPED != 0);
+    }
+
+    const CLONED: u8 = 0b0001;
+    const WOKE: u8 = 0b0010;
+    const DROPPED: u8 = 0b0100;
+
+    fn create_waker() -> (Waker, Arc<WakerHandle>) {
+        let waker_handle = Arc::new(WakerHandle {
+            data: AtomicU8::new(0),
+        });
+        let data = Arc::into_raw(waker_handle.clone()) as *const _;
+        let raw_waker = RawWaker::new(data, &VTABLE);
+        (unsafe { Waker::from_raw(raw_waker) }, waker_handle)
+    }
+
+    struct WakerHandle {
+        data: AtomicU8,
+    }
+
+    impl Drop for WakerHandle {
+        fn drop(&mut self) {
+            println!("WakerHandle dropped");
+        }
+    }
+
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+
+    unsafe fn clone(data: *const ()) -> RawWaker {
+        let waker_handle = &*(data as *const WakerHandle);
+        waker_handle.data.fetch_or(CLONED, Ordering::SeqCst);
+        Arc::increment_strong_count(waker_handle);
+        RawWaker::new(data, &VTABLE)
+    }
+
+    unsafe fn wake(data: *const ()) {
+        let waker_handle = &*(data as *const WakerHandle);
+        waker_handle.data.fetch_or(WOKE, Ordering::SeqCst);
+    }
+
+    unsafe fn wake_by_ref(_data: *const ()) {
+        todo!();
+    }
+
+    unsafe fn drop(data: *const ()) {
+        let waker_handle = &*(data as *const WakerHandle);
+        waker_handle.data.fetch_or(DROPPED, Ordering::SeqCst);
+        Arc::decrement_strong_count(waker_handle);
+    }
+}
