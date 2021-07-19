@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ## [Unreleased]
 
 
+## [0.1.2] - 2021-07-19
+### Fixed
+- Don't store multiple `Waker`s for single `Listener`s that are being polled
+  multiple times. Instead only store the last `Waker`. Fixes issue #1.
+
+
 ## [0.1.1] - 2020-05-01
 ### Added
 - Add `is_triggered` method to both `Trigger` and `Listener`.
