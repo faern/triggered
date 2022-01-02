@@ -272,19 +272,17 @@ impl Listener {
             return;
         }
 
-        let mut task_guard = self
+        let task_guard = self
             .inner
             .tasks
             .lock()
             .expect("Some Trigger/Listener has panicked");
 
-        while !self.inner.complete.load(Ordering::SeqCst) {
-            task_guard = self
-                .inner
-                .condvar
-                .wait(task_guard)
-                .expect("Some Trigger/Listener has panicked");
-        }
+        let _ = self
+            .inner
+            .condvar
+            .wait_while(task_guard, |_| !self.inner.complete.load(Ordering::SeqCst))
+            .expect("Some Trigger/Listener has panicked");
     }
 
     /// Returns true if this trigger has been triggered.
