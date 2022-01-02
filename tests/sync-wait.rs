@@ -61,6 +61,60 @@ fn many_listeners_listen_first() {
 }
 
 #[test]
+fn wait_timeout() {
+    let (trigger, listener) = triggered::trigger();
+
+    let start = Instant::now();
+    let triggered = listener.wait_timeout(Duration::from_millis(100));
+    assert!(!triggered);
+    let elapsed = start.elapsed();
+    assert!(elapsed > Duration::from_millis(99));
+    assert!(elapsed < Duration::from_millis(150));
+    assert!(!listener.is_triggered())
+}
+
+#[test]
+fn wait_timeout_trigger_first() {
+    let (trigger, listener) = triggered::trigger();
+
+    trigger.trigger();
+
+    let start = Instant::now();
+    let triggered = listener.wait_timeout(Duration::from_millis(1000));
+    assert!(triggered);
+    let elapsed = start.elapsed();
+    assert!(elapsed < Duration::from_millis(10));
+}
+
+#[test]
+fn wait_timeout_triggered_while_waiting() {
+    let (trigger, listener) = triggered::trigger();
+
+    // Spawn a bunch of tasks that all await their own clone of the trigger's listener
+    let mut listeners = Vec::new();
+    for _ in 0..103 {
+        let listener = listener.clone();
+        listeners.push(thread::spawn(move || {
+            let triggered = listener.wait_timeout(Duration::from_millis(1000));
+            assert!(triggered);
+            Instant::now()
+        }));
+    }
+
+    // Pause a while to let most/all listeners end up in wait(), then trigger.
+    thread::sleep(Duration::from_millis(100));
+
+    let trigger_instant = Instant::now();
+    trigger.trigger();
+
+    // Make sure all tasks finish
+    for listener in listeners {
+        let wakeup_instant = listener.join().expect("Listener task panicked");
+        assert!(trigger_instant < wakeup_instant);
+    }
+}
+
+#[test]
 fn is_triggered() {
     let (trigger, listener) = triggered::trigger();
     assert!(!trigger.is_triggered());

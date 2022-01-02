@@ -129,6 +129,7 @@ use std::sync::{
     Arc, Condvar, Mutex,
 };
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
 /// Returns a [`Trigger`] and [`Listener`] pair bound to each other.
 ///
@@ -283,6 +284,38 @@ impl Listener {
             .condvar
             .wait_while(task_guard, |_| !self.inner.complete.load(Ordering::SeqCst))
             .expect("Some Trigger/Listener has panicked");
+    }
+
+    /// Wait for this trigger synchronously, timing out after a specified duration.
+    ///
+    /// The semantics of this function are equivalent to [`Listener::wait`] except that the
+    /// thread will be blocked for roughly no longer than `duration`.
+    ///
+    /// Returns `true` if this method returned because the trigger was triggered. Returns
+    /// `false` if it returned due to the timeout.
+    ///
+    /// In an async program the same can be achieved by wrapping the `Listener` in one of the
+    /// many `Timeout` implementations that exists.
+    pub fn wait_timeout(&self, duration: Duration) -> bool {
+        if self.inner.complete.load(Ordering::SeqCst) {
+            return true;
+        }
+
+        let task_guard = self
+            .inner
+            .tasks
+            .lock()
+            .expect("Some Trigger/Listener has panicked");
+
+        let _ = self
+            .inner
+            .condvar
+            .wait_timeout_while(task_guard, duration, |_| {
+                !self.inner.complete.load(Ordering::SeqCst)
+            })
+            .expect("Some Trigger/Listener has panicked");
+
+        self.inner.complete.load(Ordering::SeqCst)
     }
 
     /// Returns true if this trigger has been triggered.
