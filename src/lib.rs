@@ -126,10 +126,11 @@ use std::mem;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Condvar, Mutex,
+    Arc, Mutex,
 };
-use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::task;
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Returns a [`Trigger`] and [`Listener`] pair bound to each other.
 ///
@@ -138,8 +139,7 @@ use std::time::Duration;
 pub fn trigger() -> (Trigger, Listener) {
     let inner = Arc::new(Inner {
         complete: AtomicBool::new(false),
-        tasks: Mutex::new(HashMap::new()),
-        condvar: Condvar::new(),
+        listeners: Mutex::new(HashMap::new()),
         next_listener_id: AtomicUsize::new(1),
     });
     let trigger = Trigger {
@@ -182,7 +182,7 @@ impl Clone for Listener {
 impl Drop for Listener {
     fn drop(&mut self) {
         self.inner
-            .tasks
+            .listeners
             .lock()
             .expect("Some Trigger/Listener has panicked")
             .remove(&self.id);
@@ -192,8 +192,7 @@ impl Drop for Listener {
 #[derive(Debug)]
 struct Inner {
     complete: AtomicBool,
-    tasks: Mutex<HashMap<usize, Waker>>,
-    condvar: Condvar,
+    listeners: Mutex<HashMap<usize, ListenerWaker>>,
     next_listener_id: AtomicUsize,
 }
 
@@ -219,17 +218,16 @@ impl Trigger {
         }
         // This code will only be executed once per trigger instance. No matter the amount of
         // `Trigger` clones or calls to `trigger()`, thanks to the atomic swap above.
-        let mut tasks_guard = self
+        let mut listeners_guard = self
             .inner
-            .tasks
+            .listeners
             .lock()
             .expect("Some Trigger/Listener has panicked");
-        let tasks = mem::take(&mut *tasks_guard);
-        mem::drop(tasks_guard);
-        for (_listener_id, task) in tasks {
-            task.wake();
+        let listeners = mem::take(&mut *listeners_guard);
+        mem::drop(listeners_guard);
+        for (_listener_id, waker) in listeners {
+            waker.unpark();
         }
-        self.inner.condvar.notify_all();
     }
 
     /// Returns true if this trigger has been triggered.
@@ -241,24 +239,24 @@ impl Trigger {
 impl std::future::Future for Listener {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.inner.complete.load(Ordering::SeqCst) {
-            return Poll::Ready(());
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
+        if self.is_triggered() {
+            return task::Poll::Ready(());
         }
 
-        let mut task_guard = self
+        let mut listeners_guard = self
             .inner
-            .tasks
+            .listeners
             .lock()
             .expect("Some Trigger/Listener has panicked");
 
         // If the trigger completed while we waited for the lock, skip adding our waker to the list
-        // of tasks.
-        if self.inner.complete.load(Ordering::SeqCst) {
-            Poll::Ready(())
+        // of listeners.
+        if self.is_triggered() {
+            task::Poll::Ready(())
         } else {
-            task_guard.insert(self.id, cx.waker().clone());
-            Poll::Pending
+            listeners_guard.insert(self.id, ListenerWaker::task_waker(cx));
+            task::Poll::Pending
         }
     }
 }
@@ -269,21 +267,28 @@ impl Listener {
     /// Blocks the current thread until the corresponding [`Trigger`] is triggered.
     /// If the trigger has already been triggered at least once, this returns immediately.
     pub fn wait(&self) {
-        if self.inner.complete.load(Ordering::SeqCst) {
+        if self.is_triggered() {
             return;
         }
 
-        let task_guard = self
+        let mut listeners_guard = self
             .inner
-            .tasks
+            .listeners
             .lock()
             .expect("Some Trigger/Listener has panicked");
 
-        let _ = self
-            .inner
-            .condvar
-            .wait_while(task_guard, |_| !self.inner.complete.load(Ordering::SeqCst))
-            .expect("Some Trigger/Listener has panicked");
+        // If the trigger completed while we waited for the lock, skip adding our waker to the list
+        // of listeners.
+        if self.is_triggered() {
+            return;
+        } else {
+            listeners_guard.insert(self.id, ListenerWaker::current_thread());
+            drop(listeners_guard);
+        }
+
+        while !self.is_triggered() {
+            thread::park();
+        }
     }
 
     /// Wait for this trigger synchronously, timing out after a specified duration.
@@ -297,30 +302,72 @@ impl Listener {
     /// In an async program the same can be achieved by wrapping the `Listener` in one of the
     /// many `Timeout` implementations that exists.
     pub fn wait_timeout(&self, duration: Duration) -> bool {
-        if self.inner.complete.load(Ordering::SeqCst) {
+        let deadline = Instant::now() + duration;
+
+        if self.is_triggered() {
             return true;
         }
 
-        let task_guard = self
+        let mut listeners_guard = self
             .inner
-            .tasks
+            .listeners
             .lock()
             .expect("Some Trigger/Listener has panicked");
 
-        let _ = self
-            .inner
-            .condvar
-            .wait_timeout_while(task_guard, duration, |_| {
-                !self.inner.complete.load(Ordering::SeqCst)
-            })
-            .expect("Some Trigger/Listener has panicked");
+        // If the trigger completed while we waited for the lock, skip adding our waker to the list
+        // of listeners.
+        if self.is_triggered() {
+            return true;
+        } else {
+            listeners_guard.insert(self.id, ListenerWaker::current_thread());
+            drop(listeners_guard);
+        }
 
-        self.inner.complete.load(Ordering::SeqCst)
+        loop {
+            match deadline.checked_duration_since(Instant::now()) {
+                // Now is later than the deadline. We timed out.
+                None => {
+                    self.inner
+                        .listeners
+                        .lock()
+                        .expect("Some Trigger/Listener has panicked")
+                        .remove(&self.id);
+                    break self.is_triggered();
+                }
+                Some(timeout_left) => thread::park_timeout(timeout_left),
+            }
+            if self.is_triggered() {
+                break true;
+            }
+        }
     }
 
     /// Returns true if this trigger has been triggered.
     pub fn is_triggered(&self) -> bool {
         self.inner.complete.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Debug)]
+enum ListenerWaker {
+    Thread(thread::Thread),
+    Task(task::Waker),
+}
+
+impl ListenerWaker {
+    pub fn current_thread() -> Self {
+        Self::Thread(thread::current())
+    }
+
+    pub fn task_waker(cx: &task::Context<'_>) -> Self {
+        Self::Task(cx.waker().clone())
+    }
+
+    pub fn unpark(self) {
+        match self {
+            ListenerWaker::Thread(thread) => thread.unpark(),
+            ListenerWaker::Task(waker) => waker.wake(),
+        }
     }
 }
 
@@ -338,18 +385,18 @@ mod tests {
 
         let (waker1, waker_handle1) = create_waker();
         {
-            let mut context = Context::from_waker(&waker1);
+            let mut context = task::Context::from_waker(&waker1);
             let listener = Pin::new(&mut listener);
-            assert_eq!(listener.poll(&mut context), Poll::Pending);
+            assert_eq!(listener.poll(&mut context), task::Poll::Pending);
         }
         assert!(waker_handle1.data.load(Ordering::SeqCst) & CLONED != 0);
         assert!(waker_handle1.data.load(Ordering::SeqCst) & DROPPED == 0);
 
         let (waker2, waker_handle2) = create_waker();
         {
-            let mut context = Context::from_waker(&waker2);
+            let mut context = task::Context::from_waker(&waker2);
             let listener = Pin::new(&mut listener);
-            assert_eq!(listener.poll(&mut context), Poll::Pending);
+            assert_eq!(listener.poll(&mut context), task::Poll::Pending);
         }
         assert!(waker_handle2.data.load(Ordering::SeqCst) & CLONED != 0);
         assert!(waker_handle2.data.load(Ordering::SeqCst) & DROPPED == 0);
@@ -360,13 +407,13 @@ mod tests {
     const WOKE: u8 = 0b0010;
     const DROPPED: u8 = 0b0100;
 
-    fn create_waker() -> (Waker, Arc<WakerHandle>) {
+    fn create_waker() -> (task::Waker, Arc<WakerHandle>) {
         let waker_handle = Arc::new(WakerHandle {
             data: AtomicU8::new(0),
         });
         let data = Arc::into_raw(waker_handle.clone()) as *const _;
         let raw_waker = RawWaker::new(data, &VTABLE);
-        (unsafe { Waker::from_raw(raw_waker) }, waker_handle)
+        (unsafe { task::Waker::from_raw(raw_waker) }, waker_handle)
     }
 
     struct WakerHandle {
