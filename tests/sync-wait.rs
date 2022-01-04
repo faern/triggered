@@ -66,10 +66,18 @@ fn wait_timeout() {
 
     let start = Instant::now();
     let triggered = listener.wait_timeout(Duration::from_millis(100));
-    assert!(!triggered);
     let elapsed = start.elapsed();
-    assert!(elapsed > Duration::from_millis(99));
-    assert!(elapsed < Duration::from_millis(150));
+    assert!(!triggered);
+    assert!(
+        elapsed > Duration::from_millis(99),
+        "Timeout not within acceptable range: {:?}",
+        elapsed
+    );
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "Timeout not within acceptable range: {:?}",
+        elapsed
+    );
     assert!(!listener.is_triggered())
 }
 
