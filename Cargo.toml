@@ -13,7 +13,7 @@ edition = "2018"
 [dependencies]
 
 [dev-dependencies]
-tokio = { version = "0.2.11", features = ["macros", "rt-threaded"] }
+tokio = { version = "1.15.0", features = ["rt", "rt-multi-thread", "macros"] }
 async-std = { version = "1.5.0", features = ["attributes"] }
 ctrlc = "3.1.4"
 futures = "0.3.4"
