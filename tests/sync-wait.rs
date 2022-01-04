@@ -62,7 +62,7 @@ fn many_listeners_listen_first() {
 
 #[test]
 fn wait_timeout() {
-    let (trigger, listener) = triggered::trigger();
+    let (_trigger, listener) = triggered::trigger();
 
     let start = Instant::now();
     let triggered = listener.wait_timeout(Duration::from_millis(100));
