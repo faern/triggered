@@ -174,7 +174,7 @@ pub struct Listener {
 
 impl Listener {
     fn new(inner: Arc<Inner>) -> Self {
-        let id = inner.next_listener_id.fetch_add(1, Ordering::SeqCst);
+        let id = inner.next_listener_id.fetch_add(1, Ordering::Relaxed);
         Listener {
             inner,
             id,
