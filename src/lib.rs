@@ -15,70 +15,6 @@
 //!
 //! This crate does not use any `unsafe` code.
 //!
-//! # Examples
-//!
-//! A trivial example showing the basic usage:
-//!
-//! ```
-//! #[tokio::main]
-//! async fn main() {
-//!     let (trigger, listener) = triggered::trigger();
-//!
-//!     let task = tokio::spawn(async {
-//!         // Blocks until `trigger.trigger()` below
-//!         listener.await;
-//!
-//!         println!("Triggered async task");
-//!     });
-//!
-//!     // This will make any thread blocked in `Listener::wait()` or async task awaiting the
-//!     // listener continue execution again.
-//!     trigger.trigger();
-//!
-//!     let _ = task.await;
-//! }
-//! ```
-//!
-//! An example showing a trigger/listener pair being used to gracefully shut down some async
-//! server instances on a Ctrl-C event, where only an immutable `Fn` closure is accepted:
-//!
-//! ```
-//! # use std::future::Future;
-//! # type Error = Box<dyn std::error::Error>;
-//! # struct SomeServer;
-//! # impl SomeServer {
-//! #    fn new() -> Self { SomeServer }
-//! #    async fn serve_with_shutdown_signal(self, s: impl Future<Output = ()>) -> Result<(), Error> {Ok(())}
-//! #    async fn serve(self) -> Result<(), Error> {Ok(())}
-//! # }
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Error> {
-//!     let (shutdown_trigger, shutdown_signal1) = triggered::trigger();
-//!
-//!     // A sync `Fn` closure will trigger the trigger when the user hits Ctrl-C
-//!     ctrlc::set_handler(move || {
-//!         shutdown_trigger.trigger();
-//!     }).expect("Error setting Ctrl-C handler");
-//!
-//!     // If the server library has support for something like a shutdown signal:
-//!     let shutdown_signal2 = shutdown_signal1.clone();
-//!     let server1_task = tokio::spawn(async move {
-//!         SomeServer::new().serve_with_shutdown_signal(shutdown_signal1).await;
-//!     });
-//!
-//!     // Or just select between the long running future and the signal to abort it
-//!     tokio::select! {
-//!         server_result = SomeServer::new().serve() => {
-//!             eprintln!("Server error: {:?}", server_result);
-//!         }
-//!         _ = shutdown_signal2 => {}
-//!     }
-//!
-//!     let _ = server1_task.await;
-//!     Ok(())
-//! }
-//! ```
 //!
 //! # Rust Compatibility
 //!
@@ -121,42 +57,14 @@
 #![deny(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
-use std::collections::HashMap;
 use std::mem;
-use std::pin::Pin;
-use std::task;
-use std::time::{Duration, Instant};
 
-mod thread {
-    #[cfg(not(loom))]
-    pub use std::thread::{current, park, park_timeout, Thread};
-
-    #[cfg(loom)]
-    pub use loom::thread::{current, park, Thread};
-
-    // loom does not support parking with a timeout. So we just
-    // yield. This means that the "park" will "spuriously" wake up
-    // way too early. But the code should properly handle this.
-    // One thing to note is that very short timeouts are needed
-    // when using loom, since otherwise the looping will cause
-    // an overflow in loom.
-    #[cfg(loom)]
-    pub fn park_timeout(_timeout: std::time::Duration) {
-        loom::thread::yield_now()
-    }
-}
-
-#[cfg(loom)]
+use loom::thread;
 use loom::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 
-#[cfg(not(loom))]
-use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    Arc, Mutex,
-};
 
 /// Returns a [`Trigger`] and [`Listener`] pair bound to each other.
 ///
@@ -165,13 +73,12 @@ use std::sync::{
 pub fn trigger() -> (Trigger, Listener) {
     let inner = Arc::new(Inner {
         complete: AtomicBool::new(false),
-        listeners: Mutex::new(HashMap::new()),
-        next_listener_id: AtomicUsize::new(1),
+        listeners: Mutex::new(Vec::new()),
     });
     let trigger = Trigger {
         inner: inner.clone(),
     };
-    let listener = Listener::new(inner);
+    let listener = Listener { inner };
     (trigger, listener)
 }
 
@@ -190,50 +97,15 @@ pub struct Trigger {
 ///
 /// The listener can be cloned and any amount of threads and tasks can wait for the same trigger
 /// at the same time.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Listener {
     inner: Arc<Inner>,
-    id: usize,
-    /// If this `Listener` instance has been added to `inner.listeners` by a `Future::poll` call.
-    is_in_listeners: bool,
-}
-
-impl Listener {
-    fn new(inner: Arc<Inner>) -> Self {
-        let id = inner.next_listener_id.fetch_add(1, Ordering::Relaxed);
-        Listener {
-            inner,
-            id,
-            is_in_listeners: false,
-        }
-    }
-}
-
-impl Clone for Listener {
-    fn clone(&self) -> Self {
-        Self::new(self.inner.clone())
-    }
-}
-
-impl Drop for Listener {
-    fn drop(&mut self) {
-        // We only want to pay for acquiring the lock if there is any risk we are in the hashmap.
-        // Being polled as a future is the only way to still be in the listeners map on drop.
-        if self.is_in_listeners {
-            self.inner
-                .listeners
-                .lock()
-                .expect("Some Trigger/Listener has panicked")
-                .remove(&self.id);
-        }
-    }
 }
 
 #[derive(Debug)]
 struct Inner {
     complete: AtomicBool,
-    listeners: Mutex<HashMap<usize, ListenerWaker>>,
-    next_listener_id: AtomicUsize,
+    listeners: Mutex<Vec<thread::Thread>>,
 }
 
 impl Unpin for Trigger {}
@@ -265,41 +137,14 @@ impl Trigger {
             .expect("Some Trigger/Listener has panicked");
         let listeners = mem::take(&mut *listeners_guard);
         mem::drop(listeners_guard);
-        for (_listener_id, waker) in listeners {
-            waker.unpark();
+        for thread in listeners {
+            thread.unpark();
         }
     }
 
     /// Returns true if this trigger has been triggered.
     pub fn is_triggered(&self) -> bool {
         self.inner.complete.load(Ordering::SeqCst)
-    }
-}
-
-impl std::future::Future for Listener {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
-        if self.is_triggered() {
-            return task::Poll::Ready(());
-        }
-
-        let mut listeners_guard = self
-            .inner
-            .listeners
-            .lock()
-            .expect("Some Trigger/Listener has panicked");
-
-        // If the trigger completed while we waited for the lock, skip adding our waker to the list
-        // of listeners.
-        if self.is_triggered() {
-            task::Poll::Ready(())
-        } else {
-            listeners_guard.insert(self.id, ListenerWaker::task_waker(cx));
-            drop(listeners_guard);
-            self.is_in_listeners = true;
-            task::Poll::Pending
-        }
     }
 }
 
@@ -324,63 +169,12 @@ impl Listener {
         if self.is_triggered() {
             return;
         } else {
-            listeners_guard.insert(self.id, ListenerWaker::current_thread());
+            listeners_guard.push(thread::current());
             drop(listeners_guard);
         }
 
         while !self.is_triggered() {
             thread::park();
-        }
-    }
-
-    /// Wait for this trigger synchronously, timing out after a specified duration.
-    ///
-    /// The semantics of this function are equivalent to [`Listener::wait`] except that the
-    /// thread will be blocked for roughly no longer than `duration`.
-    ///
-    /// Returns `true` if this method returned because the trigger was triggered. Returns
-    /// `false` if it returned due to the timeout.
-    ///
-    /// In an async program the same can be achieved by wrapping the `Listener` in one of the
-    /// many `Timeout` implementations that exists.
-    pub fn wait_timeout(&self, duration: Duration) -> bool {
-        let deadline = Instant::now() + duration;
-
-        if self.is_triggered() {
-            return true;
-        }
-
-        let mut listeners_guard = self
-            .inner
-            .listeners
-            .lock()
-            .expect("Some Trigger/Listener has panicked");
-
-        // If the trigger completed while we waited for the lock, skip adding our waker to the list
-        // of listeners.
-        if self.is_triggered() {
-            return true;
-        } else {
-            listeners_guard.insert(self.id, ListenerWaker::current_thread());
-            drop(listeners_guard);
-        }
-
-        loop {
-            match deadline.checked_duration_since(Instant::now()) {
-                // Now is later than the deadline. We timed out.
-                None => {
-                    self.inner
-                        .listeners
-                        .lock()
-                        .expect("Some Trigger/Listener has panicked")
-                        .remove(&self.id);
-                    break self.is_triggered();
-                }
-                Some(timeout_left) => thread::park_timeout(timeout_left),
-            }
-            if self.is_triggered() {
-                break true;
-            }
         }
     }
 
@@ -390,105 +184,24 @@ impl Listener {
     }
 }
 
-#[derive(Debug)]
-enum ListenerWaker {
-    Thread(thread::Thread),
-    Task(task::Waker),
-}
+#[test]
+fn wait_and_trigger() {
+    loom::model(|| {
+        let (trigger, listener) = crate::trigger();
 
-impl ListenerWaker {
-    pub fn current_thread() -> Self {
-        Self::Thread(thread::current())
-    }
-
-    pub fn task_waker(cx: &task::Context<'_>) -> Self {
-        Self::Task(cx.waker().clone())
-    }
-
-    pub fn unpark(self) {
-        match self {
-            ListenerWaker::Thread(thread) => thread.unpark(),
-            ListenerWaker::Task(waker) => waker.wake(),
-        }
-    }
-}
-
-#[allow(unsafe_code)]
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::future::Future;
-    use std::sync::atomic::AtomicU8;
-    use std::task::{RawWaker, RawWakerVTable};
-
-    #[test]
-    fn polling_listener_keeps_only_last_waker() {
-        let (_trigger, mut listener) = trigger();
-
-        let (waker1, waker_handle1) = create_waker();
-        {
-            let mut context = task::Context::from_waker(&waker1);
-            let listener = Pin::new(&mut listener);
-            assert_eq!(listener.poll(&mut context), task::Poll::Pending);
-        }
-        assert!(waker_handle1.data.load(Ordering::SeqCst) & CLONED != 0);
-        assert!(waker_handle1.data.load(Ordering::SeqCst) & DROPPED == 0);
-
-        let (waker2, waker_handle2) = create_waker();
-        {
-            let mut context = task::Context::from_waker(&waker2);
-            let listener = Pin::new(&mut listener);
-            assert_eq!(listener.poll(&mut context), task::Poll::Pending);
-        }
-        assert!(waker_handle2.data.load(Ordering::SeqCst) & CLONED != 0);
-        assert!(waker_handle2.data.load(Ordering::SeqCst) & DROPPED == 0);
-        assert!(waker_handle1.data.load(Ordering::SeqCst) & DROPPED != 0);
-    }
-
-    const CLONED: u8 = 0b0001;
-    const WOKE: u8 = 0b0010;
-    const DROPPED: u8 = 0b0100;
-
-    fn create_waker() -> (task::Waker, Arc<WakerHandle>) {
-        let waker_handle = Arc::new(WakerHandle {
-            data: AtomicU8::new(0),
+        let thread_handle = thread::spawn(move || {
+            //thread::yield_now();
+            trigger.trigger();
+            assert!(trigger.is_triggered());
         });
-        let data = Arc::into_raw(waker_handle.clone()) as *const _;
-        let raw_waker = RawWaker::new(data, &VTABLE);
-        (unsafe { task::Waker::from_raw(raw_waker) }, waker_handle)
-    }
 
-    struct WakerHandle {
-        data: AtomicU8,
-    }
+        //thread::yield_now();
+        listener.wait();
 
-    impl Drop for WakerHandle {
-        fn drop(&mut self) {
-            println!("WakerHandle dropped");
-        }
-    }
+        assert!(listener.is_triggered());
 
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-
-    unsafe fn clone(data: *const ()) -> RawWaker {
-        let waker_handle = &*(data as *const WakerHandle);
-        waker_handle.data.fetch_or(CLONED, Ordering::SeqCst);
-        Arc::increment_strong_count(waker_handle);
-        RawWaker::new(data, &VTABLE)
-    }
-
-    unsafe fn wake(data: *const ()) {
-        let waker_handle = &*(data as *const WakerHandle);
-        waker_handle.data.fetch_or(WOKE, Ordering::SeqCst);
-    }
-
-    unsafe fn wake_by_ref(_data: *const ()) {
-        todo!();
-    }
-
-    unsafe fn drop(data: *const ()) {
-        let waker_handle = &*(data as *const WakerHandle);
-        waker_handle.data.fetch_or(DROPPED, Ordering::SeqCst);
-        Arc::decrement_strong_count(waker_handle);
-    }
+        // Uncomment any of the `yield_now` calls or remove this join
+        // to make the test pass.
+        thread_handle.join().expect("Trigger thread panic");
+    })
 }

@@ -11,17 +11,4 @@ categories = ["asynchronous", "concurrency"]
 edition = "2018"
 
 [dependencies]
-
-[dev-dependencies]
-ctrlc = "3.1.4"
-futures = "0.3.4"
-
-[target.'cfg(not(loom))'.dev-dependencies]
-tokio = { version = "1.15.0", features = ["rt", "rt-multi-thread", "macros"] }
-async-std = { version = "1.5.0", features = ["attributes"] }
-
-[target.'cfg(loom)'.dependencies]
-loom = "0.5.4"
-
-[features]
-checkpoint = ["loom/checkpoint"]
+loom = { version = "0.5.4", features = ["checkpoint"] }
