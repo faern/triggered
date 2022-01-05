@@ -124,13 +124,39 @@
 use std::collections::HashMap;
 use std::mem;
 use std::pin::Pin;
+use std::task;
+use std::time::{Duration, Instant};
+
+mod thread {
+    #[cfg(not(loom))]
+    pub use std::thread::{current, park, park_timeout, Thread};
+
+    #[cfg(loom)]
+    pub use loom::thread::{current, park, Thread};
+
+    // loom does not support parking with a timeout. So we just
+    // yield. This means that the "park" will "spuriously" wake up
+    // way too early. But the code should properly handle this.
+    // One thing to note is that very short timeouts are needed
+    // when using loom, since otherwise the looping will cause
+    // an overflow in loom.
+    #[cfg(loom)]
+    pub fn park_timeout(_timeout: std::time::Duration) {
+        loom::thread::yield_now()
+    }
+}
+
+#[cfg(loom)]
+use loom::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+
+#[cfg(not(loom))]
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
-use std::task;
-use std::thread;
-use std::time::{Duration, Instant};
 
 /// Returns a [`Trigger`] and [`Listener`] pair bound to each other.
 ///
