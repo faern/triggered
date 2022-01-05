@@ -145,7 +145,7 @@ pub fn trigger() -> (Trigger, Listener) {
     let trigger = Trigger {
         inner: inner.clone(),
     };
-    let listener = Listener { inner, id: 0 };
+    let listener = Listener::new(inner);
     (trigger, listener)
 }
 
@@ -168,24 +168,38 @@ pub struct Trigger {
 pub struct Listener {
     inner: Arc<Inner>,
     id: usize,
+    /// If this `Listener` instance has been added to `inner.listeners` by a `Future::poll` call.
+    is_in_listeners: bool,
+}
+
+impl Listener {
+    fn new(inner: Arc<Inner>) -> Self {
+        let id = inner.next_listener_id.fetch_add(1, Ordering::SeqCst);
+        Listener {
+            inner,
+            id,
+            is_in_listeners: false,
+        }
+    }
 }
 
 impl Clone for Listener {
     fn clone(&self) -> Self {
-        Listener {
-            inner: self.inner.clone(),
-            id: self.inner.next_listener_id.fetch_add(1, Ordering::SeqCst),
-        }
+        Self::new(self.inner.clone())
     }
 }
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        self.inner
-            .listeners
-            .lock()
-            .expect("Some Trigger/Listener has panicked")
-            .remove(&self.id);
+        // We only want to pay for acquiring the lock if there is any risk we are in the hashmap.
+        // Being polled as a future is the only way to still be in the listeners map on drop.
+        if self.is_in_listeners {
+            self.inner
+                .listeners
+                .lock()
+                .expect("Some Trigger/Listener has panicked")
+                .remove(&self.id);
+        }
     }
 }
 
@@ -239,7 +253,7 @@ impl Trigger {
 impl std::future::Future for Listener {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> task::Poll<Self::Output> {
         if self.is_triggered() {
             return task::Poll::Ready(());
         }
@@ -256,6 +270,8 @@ impl std::future::Future for Listener {
             task::Poll::Ready(())
         } else {
             listeners_guard.insert(self.id, ListenerWaker::task_waker(cx));
+            drop(listeners_guard);
+            self.is_in_listeners = true;
             task::Poll::Pending
         }
     }
