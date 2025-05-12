@@ -279,7 +279,7 @@ impl Listener {
             .lock()
             .expect("Some Trigger/Listener has panicked");
 
-        let _ = self
+        let _guard = self
             .inner
             .condvar
             .wait_while(task_guard, |_| !self.inner.complete.load(Ordering::SeqCst))

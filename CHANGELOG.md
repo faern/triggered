@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - Add `Listener::wait_timeout`. Allows waiting for a trigger for a max amount of time.
 - Add license files to the package/repository.
 
+### Fixed
+- Fix `let_underscore_lock` error, not assigning a lock guard to a variable.
+
 
 ## [0.1.2] - 2021-07-19
 ### Fixed
