@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ## [Unreleased]
 
 
+## [0.1.3] - 2025-05-12
+### Added
+- Add `Listener::wait_timeout`. Allows waiting for a trigger for a max amount of time.
+- Add license files to the package/repository.
+
+
 ## [0.1.2] - 2021-07-19
 ### Fixed
 - Don't store multiple `Waker`s for single `Listener`s that are being polled
